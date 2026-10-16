@@ -1,19 +1,163 @@
 // TunnelBar — a tiny menu bar app that turns the SSH tunnels in ~/.ssh/config on and off.
 //
-// Any `Host` block (without wildcards) that has LocalForward / RemoteForward / DynamicForward
-// lines shows up as a tunnel. Each tunnel runs as `/usr/bin/ssh -N <host>`, so everything
-// OpenSSH supports (ProxyJump, IdentityFile, agent, certificates…) just works.
+// Any `Host` (without wildcards) whose resolved config has LocalForward / RemoteForward /
+// DynamicForward lines shows up as a tunnel. Each tunnel runs as `/usr/bin/ssh -N <host>`, so
+// everything OpenSSH supports (ProxyJump, IdentityFile, agent, certificates…) just works.
 
 import AppKit
+import Darwin
 import ServiceManagement
 import SwiftUI
 
 // MARK: - SSH config
 
+struct Forward: Hashable {
+    enum Kind: Int, Hashable { case local, dynamic, remote }
+
+    struct Endpoint: Hashable {
+        var host: String?  // nil = ssh's default bind address (localhost)
+        var port: Int?
+        var path: String?  // Unix socket
+    }
+
+    enum Action: Equatable {
+        case open(URL)
+        case copy(String)
+        var label: String {
+            if case .open = self { return "Open" }
+            return "Copy"
+        }
+    }
+
+    let kind: Kind
+    let listen: Endpoint
+    let target: Endpoint?  // nil for DynamicForward and dynamic RemoteForward
+
+    /// Ports whose service isn't a web page, so clicking copies the address instead of opening a browser.
+    private static let nonWebPorts: Set<Int> = [
+        21, 22, 25, 53, 110, 143, 389, 445, 587, 993, 995, 1433, 1521, 2222, 3306, 3389,
+        5432, 5672, 6379, 9042, 9092, 11211, 27017,
+    ]
+
+    static func isLoopback(_ host: String?) -> Bool {
+        guard let host else { return true }
+        return ["localhost", "127.0.0.1", "::1"].contains(host.lowercased())
+    }
+
+    static func hostPort(_ host: String, _ port: Int) -> String {
+        host.contains(":") ? "[\(host)]:\(port)" : "\(host):\(port)"
+    }
+
+    /// Where you connect on this Mac for local and SOCKS forwards, e.g. "localhost:5900".
+    var localAddress: String? {
+        guard kind != .remote else { return nil }
+        if let path = listen.path { return path }
+        guard let port = listen.port else { return nil }
+        return Self.hostPort(Self.isLoopback(listen.host) ? "localhost" : listen.host!, port)
+    }
+
+    /// The address worth copying: where you connect for L/D, where the server listens for R.
+    func address(server: String) -> String? {
+        if kind == .remote { return listen.path ?? listen.port.map { Self.hostPort(server, $0) } }
+        return localAddress
+    }
+
+    /// Human-readable "from → to", naming the server instead of its own "localhost".
+    func summary(server: String) -> String {
+        switch kind {
+        case .dynamic:
+            return "SOCKS proxy on \(localAddress ?? "?")"
+        case .local:
+            guard let target else { return localAddress ?? "?" }
+            if let path = target.path { return "\(localAddress ?? "?") → \(server):\(path)" }
+            if Self.isLoopback(target.host) {
+                return "\(localAddress ?? "?") → \(target.port.map { Self.hostPort(server, $0) } ?? server)"
+            }
+            let to = target.port.map { Self.hostPort(target.host!, $0) } ?? target.host!
+            return "\(localAddress ?? "?") → \(to) via \(server)"
+        case .remote:
+            let from = address(server: server) ?? "?"
+            guard let target else { return "\(from) → SOCKS via this Mac" }
+            if let path = target.path { return "\(from) → \(path)" }
+            let host = Self.isLoopback(target.host) ? "localhost" : target.host!
+            return "\(from) → \(target.port.map { Self.hostPort(host, $0) } ?? host)"
+        }
+    }
+
+    /// The same forward written as an ssh command-line flag, e.g. "-L 5900:localhost:5900".
+    var sshFlag: String {
+        func spec(_ e: Endpoint) -> String {
+            if let path = e.path { return path }
+            let port = e.port.map(String.init) ?? ""
+            guard let host = e.host else { return port }
+            return (host.contains(":") ? "[\(host)]" : host) + ":" + port
+        }
+        switch kind {
+        case .local: return "-L \(spec(listen)):\(target.map(spec) ?? "")"
+        case .dynamic: return "-D \(spec(listen))"
+        case .remote: return target.map { "-R \(spec(listen)):\(spec($0))" } ?? "-R \(spec(listen))"
+        }
+    }
+
+    /// What a click does: open VNC/web forwards, copy everything else.
+    var primaryAction: Action? {
+        switch kind {
+        case .remote:
+            return nil
+        case .dynamic:
+            return localAddress.map { .copy("socks5://\($0)") }
+        case .local:
+            guard let address = localAddress else { return nil }
+            guard listen.port != nil else { return .copy(address) }
+            // Classify by the service's real port (the target), but connect to the local one.
+            let servicePort = target?.port ?? listen.port!
+            if (5900...5999).contains(servicePort), let url = URL(string: "vnc://\(address)") { return .open(url) }
+            if Self.nonWebPorts.contains(servicePort) { return .copy(address) }
+            let scheme = [443, 8443].contains(servicePort) ? "https" : "http"
+            return URL(string: "\(scheme)://\(address)").map { .open($0) } ?? .copy(address)
+        }
+    }
+}
+
 struct Tunnel: Identifiable, Hashable {
     let host: String
-    let forwards: [String]
+    let hostName: String  // what the alias resolves to, e.g. "omarchy"
+    let forwards: [Forward]
     var id: String { host }
+}
+
+/// Whether a forward's local port is currently bound (by ssh, or by something else).
+enum PortCheck {
+    static func inUse(_ forward: Forward) -> Bool? {
+        guard forward.kind != .remote, let port = forward.listen.port, (1...65535).contains(port) else { return nil }
+        let ipv6 = forward.listen.host?.contains(":") == true
+        let fd = socket(ipv6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        defer { close(fd) }
+
+        let result: Int32
+        if ipv6 {
+            var addr = sockaddr_in6()
+            addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+            addr.sin6_family = sa_family_t(AF_INET6)
+            addr.sin6_port = in_port_t(UInt16(port).bigEndian)
+            addr.sin6_addr = in6addr_loopback
+            result = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in6>.size)) }
+            }
+        } else {
+            var addr = sockaddr_in()
+            addr.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            addr.sin_family = sa_family_t(AF_INET)
+            addr.sin_port = in_port_t(UInt16(port).bigEndian)
+            let literal = forward.listen.host.map { inet_addr($0) } ?? INADDR_NONE
+            addr.sin_addr.s_addr = literal != INADDR_NONE ? literal : inet_addr("127.0.0.1")
+            result = withUnsafePointer(to: &addr) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
+            }
+        }
+        return result != 0 && errno == EADDRINUSE
+    }
 }
 
 enum SSHConfig {
@@ -29,52 +173,84 @@ enum SSHConfig {
     }
 
     static func loadTunnels() -> [Tunnel] {
-        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
-        var tunnels: [Tunnel] = []
-        var hosts: [String] = []
-        var forwards: [String] = []
-
-        func flush() {
-            if !forwards.isEmpty {
-                for host in hosts where !host.contains(where: { "*?!".contains($0) }) {
-                    tunnels.append(Tunnel(host: host, forwards: forwards))
-                }
-            }
-            hosts = []
-            forwards = []
+        hostAliases().compactMap { host in
+            guard let resolved = resolve(host), !resolved.forwards.isEmpty else { return nil }
+            return Tunnel(host: host, hostName: resolved.hostName, forwards: resolved.forwards)
         }
-
-        for raw in text.components(separatedBy: .newlines) {
-            let line = raw.trimmingCharacters(in: .whitespaces)
-            if line.isEmpty || line.hasPrefix("#") { continue }
-            let parts = line.split(maxSplits: 1, whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" })
-            guard let keyword = parts.first?.lowercased() else { continue }
-            let arg = parts.count > 1 ? parts[1].trimmingCharacters(in: CharacterSet(charactersIn: " \t=")) : ""
-            switch keyword {
-            case "host":
-                flush()
-                hosts = arg.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-            case "match":
-                flush()
-            case "localforward": forwards.append(describe("L", arg))
-            case "remoteforward": forwards.append(describe("R", arg))
-            case "dynamicforward": forwards.append(describe("D", arg))
-            default: break
-            }
-        }
-        flush()
-        return tunnels
     }
 
-    private static func describe(_ kind: String, _ arg: String) -> String {
-        let p = arg.split(whereSeparator: { $0 == " " || $0 == "\t" }).map(String.init)
-        guard let listen = p.first else { return arg }
-        let from = listen.contains(":") ? listen : ":" + listen
-        switch kind {
-        case "L": return p.count >= 2 ? "local \(from) → \(p[1])" : "local \(arg)"
-        case "R": return p.count >= 2 ? "remote \(from) → \(p[1])" : "remote \(arg)"
-        default: return "SOCKS \(from)"
+    /// Every concrete (wildcard-free) name on a `Host` line, in file order.
+    private static func hostAliases() -> [String] {
+        guard let text = try? String(contentsOfFile: path, encoding: .utf8) else { return [] }
+        var seen = Set<String>()
+        var aliases: [String] = []
+        for raw in text.components(separatedBy: .newlines) {
+            let parts = raw.trimmingCharacters(in: .whitespaces)
+                .split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "=" }).map(String.init)
+            guard parts.first?.lowercased() == "host" else { continue }
+            for alias in parts.dropFirst() where !alias.contains(where: { "*?!".contains($0) }) {
+                if seen.insert(alias).inserted { aliases.append(alias) }
+            }
         }
+        return aliases
+    }
+
+    /// Asks ssh itself for the host's final config (`ssh -G`), so forwards split across several
+    /// `Host` blocks, `Match` blocks and included files are all picked up exactly as ssh sees them.
+    private static func resolve(_ host: String) -> (hostName: String, forwards: [Forward])? {
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/ssh")
+        p.arguments = ["-G", "-F", path, host]
+        let out = Pipe()
+        p.standardOutput = out
+        p.standardError = FileHandle.nullDevice
+        p.standardInput = FileHandle.nullDevice
+        do { try p.run() } catch { return nil }
+        let data = out.fileHandleForReading.readDataToEndOfFile()
+        p.waitUntilExit()
+        guard p.terminationStatus == 0, let text = String(data: data, encoding: .utf8) else { return nil }
+
+        var hostName = host
+        var forwards: [Forward] = []
+        for line in text.split(separator: "\n") {
+            let f = line.split(separator: " ").map(String.init)
+            guard f.count >= 2 else { continue }
+            switch f[0] {
+            case "hostname":
+                hostName = f[1]
+            case "localforward" where f.count >= 3:
+                if let l = endpoint(f[1]), let t = endpoint(f[2]) { forwards.append(Forward(kind: .local, listen: l, target: t)) }
+            case "remoteforward":
+                guard let l = endpoint(f[1]) else { continue }
+                let t = f.count >= 3 ? endpoint(f[2]) : nil
+                let dynamic = t == nil || (t?.host == "socks" && t?.port == 0)  // ssh -G writes "[socks]:0"
+                forwards.append(Forward(kind: .remote, listen: l, target: dynamic ? nil : t))
+            case "dynamicforward":
+                // ssh -G also lists Unix-socket LocalForwards here; only real ports are SOCKS proxies.
+                if let l = endpoint(f[1]), l.port != nil { forwards.append(Forward(kind: .dynamic, listen: l, target: nil)) }
+            default:
+                break
+            }
+        }
+        // Stable sort: local forwards first, then SOCKS, then remote.
+        let ordered = forwards.enumerated().sorted { ($0.element.kind.rawValue, $0.offset) < ($1.element.kind.rawValue, $1.offset) }
+        return (hostName, ordered.map(\.element))
+    }
+
+    /// Parses ssh -G's forward endpoints: "5900", "[127.0.0.1]:3000", "[localhost]:5900", "/path.sock".
+    private static func endpoint(_ s: String) -> Forward.Endpoint? {
+        if s.hasPrefix("/") { return Forward.Endpoint(path: s) }
+        if s.hasPrefix("["), let close = s.firstIndex(of: "]") {
+            let host = String(s[s.index(after: s.startIndex)..<close])
+            let rest = s[s.index(after: close)...]
+            guard rest.hasPrefix(":"), let port = Int(rest.dropFirst()) else { return nil }
+            return Forward.Endpoint(host: host, port: port)
+        }
+        if let port = Int(s) { return Forward.Endpoint(port: port) }
+        if let i = s.lastIndex(of: ":"), let port = Int(s[s.index(after: i)...]) {
+            return Forward.Endpoint(host: String(s[..<i]), port: port)
+        }
+        return nil
     }
 
     static let template = """
@@ -121,6 +297,7 @@ final class TunnelManager: ObservableObject {
     @Published private(set) var states: [String: TunnelState] = [:]
     @Published private(set) var wanted: Set<String> = []
     @Published private(set) var launchAtLogin = SMAppService.mainApp.status == .enabled
+    @Published private(set) var portsInUse: Set<Forward> = []  // local/SOCKS forwards whose port is bound
 
     private var processes: [String: Process] = [:]
     private var lastMessage: [String: String] = [:]
@@ -139,10 +316,11 @@ final class TunnelManager: ObservableObject {
             let saved = UserDefaults.standard.stringArray(forKey: Self.wantedKey) ?? []
             for host in saved where tunnels.contains(where: { $0.host == host }) { start(host) }
 
-            configTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
+            configTimer = Timer.scheduledTimer(withTimeInterval: 1.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, SSHConfig.modificationDate != self.configDate else { return }
-                    self.reload()
+                    guard let self else { return }
+                    if SSHConfig.modificationDate != self.configDate { self.reload() }
+                    self.refreshPorts()
                 }
             }
             NSWorkspace.shared.notificationCenter.addObserver(
@@ -169,6 +347,46 @@ final class TunnelManager: ObservableObject {
         tunnels = SSHConfig.loadTunnels()
         let names = Set(tunnels.map(\.host))
         for host in wanted where !names.contains(host) { stop(host) }
+        refreshPorts()
+    }
+
+    func refreshPorts() {
+        let used = Set(tunnels.flatMap(\.forwards).filter { PortCheck.inUse($0) == true })
+        if used != portsInUse { portsInUse = used }
+    }
+
+    enum ForwardStatus {
+        case active, idle, notListening, portTaken
+
+        var color: Color {
+            switch self {
+            case .active: return .green
+            case .idle: return .gray.opacity(0.4)
+            case .notListening: return .orange
+            case .portTaken: return .red
+            }
+        }
+
+        var help: String {
+            switch self {
+            case .active: return "Active"
+            case .idle: return "Off"
+            case .notListening: return "Tunnel is up but this port isn't listening"
+            case .portTaken: return "Another app is using this port, so the tunnel can't open it"
+            }
+        }
+    }
+
+    func status(of forward: Forward, in tunnel: Tunnel) -> ForwardStatus {
+        let connected = state(tunnel.host) == .connected
+        // Remote forwards and Unix sockets can't be checked from here; follow the tunnel.
+        guard forward.kind != .remote, forward.listen.port != nil else { return connected ? .active : .idle }
+        switch (connected, portsInUse.contains(forward)) {
+        case (true, true): return .active
+        case (true, false): return .notListening
+        case (false, true): return .portTaken
+        case (false, false): return .idle
+        }
     }
 
     func setOn(_ host: String, _ on: Bool) { on ? start(host) : stop(host) }
@@ -190,6 +408,14 @@ final class TunnelManager: ObservableObject {
         retryCount[host] = 0
         if let p = processes.removeValue(forKey: host), p.isRunning { p.terminate() }
         states[host] = .off
+        refreshPortsSoon()
+    }
+
+    /// ssh binds (or releases) its ports a moment after the state changes; check again shortly after.
+    private func refreshPortsSoon() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            MainActor.assumeIsolated { self?.refreshPorts() }
+        }
     }
 
     /// After sleep the old connections are usually dead; restart them instead of waiting for keepalives to time out.
@@ -292,6 +518,7 @@ final class TunnelManager: ObservableObject {
                     }
                     let message = self.lastMessage[host].flatMap { $0.isEmpty ? nil : $0 }
                     self.states[host] = .failed(message ?? "ssh exited with status \(status)")
+                    self.refreshPorts()
                     self.scheduleRetry(host)
                 }
             }
@@ -312,6 +539,7 @@ final class TunnelManager: ObservableObject {
         if line.hasPrefix("Authenticated to") {
             states[host] = .connected
             retryCount[host] = 0
+            refreshPortsSoon()
         } else if !line.hasPrefix("debug"), !line.hasPrefix("OpenSSH_"), !line.hasPrefix("Transferred:") {
             lastMessage[host] = line
         }
@@ -409,7 +637,7 @@ struct MenuView: View {
             }
             .padding(.vertical, 6)
         }
-        .frame(width: 330)
+        .frame(width: 370)
     }
 }
 
@@ -419,29 +647,36 @@ struct TunnelRow: View {
 
     var body: some View {
         let state = manager.state(tunnel.host)
-        HStack(alignment: .top, spacing: 10) {
-            Circle().fill(color(for: state)).frame(width: 8, height: 8).padding(.top, 6)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(tunnel.host).font(.body.weight(.medium))
-                ForEach(tunnel.forwards, id: \.self) {
-                    Text($0).font(.caption.monospaced()).foregroundStyle(.secondary)
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .center, spacing: 10) {
+                Circle().fill(color(for: state)).frame(width: 8, height: 8)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(tunnel.host).font(.body.weight(.medium))
+                    if tunnel.hostName != tunnel.host {
+                        Text(tunnel.hostName).font(.caption).foregroundStyle(.secondary)
+                    }
                 }
-                if let detail = detail(for: state) {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(isFailed(state) ? Color.red : Color.secondary)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+                Spacer(minLength: 8)
+                Toggle("", isOn: Binding(
+                    get: { manager.wanted.contains(tunnel.host) },
+                    set: { manager.setOn(tunnel.host, $0) }
+                ))
+                .toggleStyle(.switch)
+                .controlSize(.small)
+                .labelsHidden()
             }
-            Spacer(minLength: 8)
-            Toggle("", isOn: Binding(
-                get: { manager.wanted.contains(tunnel.host) },
-                set: { manager.setOn(tunnel.host, $0) }
-            ))
-            .toggleStyle(.switch)
-            .controlSize(.small)
-            .labelsHidden()
+            if let detail = detail(for: state) {
+                Text(detail)
+                    .font(.caption)
+                    .foregroundStyle(isFailed(state) ? Color.red : Color.secondary)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .padding(.leading, 18)
+            }
+            VStack(spacing: 1) {
+                ForEach(tunnel.forwards, id: \.self) { ForwardRow(forward: $0, tunnel: tunnel) }
+            }
+            .padding(.leading, 12)
         }
         .padding(.horizontal, 14).padding(.vertical, 7)
     }
@@ -473,6 +708,105 @@ struct TunnelRow: View {
 /// Command Line Tools toolchain ships without the SwiftUI macro plugin that @State now needs.
 final class HoverState: ObservableObject {
     @Published var on = false
+}
+
+/// Per-row UI state for ForwardRow (same @State workaround as HoverState).
+final class ForwardRowState: ObservableObject {
+    @Published var hovering = false
+    @Published var copied = false
+
+    func flashCopied() {
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.copied = false }
+    }
+}
+
+/// One forwarded port: type badge, "from → to", live dot. Click opens or copies; ⌥-click copies
+/// the address; right-click offers every option including the equivalent ssh flag.
+struct ForwardRow: View {
+    @EnvironmentObject var manager: TunnelManager
+    let forward: Forward
+    let tunnel: Tunnel
+    @StateObject private var ui = ForwardRowState()
+
+    var body: some View {
+        let status = manager.status(of: forward, in: tunnel)
+        let action = forward.primaryAction
+        let clickable = action != nil || forward.address(server: tunnel.hostName) != nil
+        HStack(spacing: 7) {
+            KindBadge(kind: forward.kind)
+            Text(forward.summary(server: tunnel.hostName))
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer(minLength: 4)
+            if ui.copied {
+                Text("Copied").font(.caption2).foregroundStyle(.secondary)
+            } else if ui.hovering, clickable {
+                Text(action?.label ?? "Copy").font(.caption2.weight(.medium)).foregroundStyle(Color.accentColor)
+            }
+            Circle().fill(status.color).frame(width: 6, height: 6).help(status.help)
+        }
+        .padding(.horizontal, 6).padding(.vertical, 3)
+        .background(RoundedRectangle(cornerRadius: 4).fill(ui.hovering && clickable ? Color.primary.opacity(0.08) : Color.clear))
+        .contentShape(Rectangle())
+        .onHover { ui.hovering = $0 }
+        .onTapGesture {
+            if NSEvent.modifierFlags.contains(.option) || action == nil {
+                copy(forward.address(server: tunnel.hostName))
+            } else {
+                perform(action)
+            }
+        }
+        .contextMenu {
+            if case .open(let url)? = action {
+                Button("Open \(url.absoluteString)") { NSWorkspace.shared.open(url) }
+            }
+            if let address = forward.address(server: tunnel.hostName) {
+                Button("Copy \(address)") { copy(address) }
+            }
+            if forward.kind == .dynamic, let address = forward.localAddress {
+                Button("Copy socks5://\(address)") { copy("socks5://\(address)") }
+            }
+            Button("Copy ssh Flag: \(forward.sshFlag)") { copy(forward.sshFlag) }
+        }
+        .help("\(forward.sshFlag)\n\(status.help)")
+    }
+
+    private func perform(_ action: Forward.Action?) {
+        switch action {
+        case .open(let url)?: NSWorkspace.shared.open(url)
+        case .copy(let text)?: copy(text)
+        case nil: break
+        }
+    }
+
+    private func copy(_ text: String?) {
+        guard let text else { return }
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(text, forType: .string)
+        ui.flashCopied()
+    }
+}
+
+struct KindBadge: View {
+    let kind: Forward.Kind
+
+    var body: some View {
+        let (letter, color, title): (String, Color, String) = {
+            switch kind {
+            case .local: return ("L", .blue, "Local forward: a port on this Mac reaches the server side")
+            case .dynamic: return ("D", .teal, "Dynamic forward: SOCKS proxy on this Mac")
+            case .remote: return ("R", .purple, "Remote forward: a port on the server reaches this Mac")
+            }
+        }()
+        Text(letter)
+            .font(.system(size: 9, weight: .bold, design: .monospaced))
+            .foregroundStyle(.white)
+            .frame(width: 15, height: 14)
+            .background(RoundedRectangle(cornerRadius: 3).fill(color))
+            .help(title)
+    }
 }
 
 /// A full-width row that highlights on hover, like a native menu item.
@@ -527,8 +861,19 @@ enum SelfTest {
         print("tunnels found: \(manager.tunnels.count)")
         manager.startAll()
         RunLoop.main.run(until: Date().addingTimeInterval(seconds))
+        manager.refreshPorts()
         for t in manager.tunnels {
-            print("- \(t.host) [\(t.forwards.joined(separator: ", "))]: \(manager.state(t.host))")
+            print("- \(t.host) (\(t.hostName)): \(manager.state(t.host))")
+            for f in t.forwards {
+                let action: String
+                switch f.primaryAction {
+                case .open(let url)?: action = "click opens \(url.absoluteString)"
+                case .copy(let text)?: action = "click copies \(text)"
+                case nil: action = "click copies \(f.address(server: t.hostName) ?? "-")"
+                }
+                let flag = f.sshFlag.padding(toLength: 30, withPad: " ", startingAt: 0)
+                print("    \(flag) \(f.summary(server: t.hostName))  [\(manager.status(of: f, in: t))]  \(action)")
+            }
         }
         manager.stopAll()
         RunLoop.main.run(until: Date().addingTimeInterval(0.5))
